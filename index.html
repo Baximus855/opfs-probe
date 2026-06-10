@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OPFS SSD Timing Probe</title>
+<style>
+ body{font:14px/1.55 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:16px;background:#0b1020;color:#e6e9f0}
+ h1{font-size:16px;margin:0 0 4px}
+ .sub{color:#8a93a6;margin:0 0 14px}
+ label{display:inline-block;margin:0 14px 10px 0;color:#b9c0d0;font-size:13px}
+ input{width:78px;font-size:15px;padding:6px 8px;border:1px solid #2a3656;border-radius:6px;background:#070b18;color:#e6e9f0;margin-left:6px}
+ button{font-size:15px;padding:10px 16px;margin:4px 8px 12px 0;border:0;border-radius:8px;background:#3a4cff;color:#fff}
+ button.sec{background:#26304d}
+ pre{white-space:pre-wrap;word-break:break-word;background:#070b18;border:1px solid #1c2742;border-radius:8px;padding:12px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;min-height:80px}
+</style>
+</head>
+<body>
+<h1>OPFS SSD Timing Probe</h1>
+<p class="sub">Step 1: does the FROST primitive exist on this browser, and can we time reads.</p>
+
+<div>
+ <label>File size (MB)<input id="mb" type="number" value="64" min="8" max="1024"></label>
+ <label>Reads<input id="reads" type="number" value="800" min="100" max="20000"></label>
+</div>
+<button id="run">Run probe</button>
+<button id="copy" class="sec">Copy results</button>
+<pre id="out">Tap "Run probe" to begin. First run writes the file, so give it a few seconds.</pre>
+
+<script>
+const out = document.getElementById('out');
+let buf = '';
+function log(s){ buf += s + '\n'; out.textContent = buf; }
+document.getElementById('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(buf); log('\n[results copied to clipboard]'); }
+  catch(e){ log('\n[copy failed: ' + e.message + ' -- long-press the text to select]'); }
+};
+
+function pct(arr, p){
+  const a = arr.slice().sort((x,y)=>x-y);
+  return a[Math.min(a.length-1, Math.floor(p/100*a.length))];
+}
+function timerResolution(){
+  let min = Infinity, last = performance.now();
+  for(let i=0;i<200000;i++){
+    const t = performance.now();
+    const d = t - last;
+    if(d>0 && d<min) min = d;
+    last = t;
+  }
+  return min;
+}
+
+document.getElementById('run').onclick = async () => {
+  buf=''; out.textContent='';
+  const FILE_MB = Math.max(8, Math.min(1024, parseInt(document.getElementById('mb').value)||64));
+  const READS   = Math.max(100, Math.min(20000, parseInt(document.getElementById('reads').value)||800));
+  const BLOCK   = 4096;
+
+  log('=== ENVIRONMENT ===');
+  log('userAgent: ' + navigator.userAgent);
+  log('secureContext: ' + window.isSecureContext);
+  log('crossOriginIsolated: ' + self.crossOriginIsolated);
+  log('hardwareConcurrency: ' + navigator.hardwareConcurrency);
+  if (navigator.deviceMemory) log('deviceMemory (GB approx): ' + navigator.deviceMemory);
+  const res = timerResolution();
+  log('performance.now() smallest nonzero step: ' + res.toFixed(4) + ' ms  (' + (res*1000).toFixed(1) + ' us)');
+  const hasOPFS = !!(navigator.storage && navigator.storage.getDirectory);
+  log('OPFS getDirectory present: ' + hasOPFS);
+  if(navigator.storage && navigator.storage.estimate){
+    try{ const est = await navigator.storage.estimate();
+      log('storage quota: ' + ((est.quota/1048576)|0) + ' MB, used: ' + ((est.usage/1048576)|0) + ' MB'); }catch(e){}
+  }
+  if(!hasOPFS){
+    log('\nRESULT: OPFS is not available in this browser. The FROST primitive is absent here. That is a clean finding -- send me this output.');
+    return;
+  }
+
+  log('\n=== TIMING PROBE (Web Worker, sync access handle) ===');
+  log('config: file=' + FILE_MB + ' MB, block=' + BLOCK + ' B, reads=' + READS);
+  log('working...');
+
+  const workerSrc = `
+  self.onmessage = async (e) => {
+    const {FILE_MB, BLOCK, READS} = e.data;
+    const FILE_SIZE = FILE_MB * 1048576;
+    const say = (m)=>self.postMessage({log:m});
+    try {
+      if(!(navigator.storage && navigator.storage.getDirectory)){ self.postMessage({error:'no OPFS inside worker'}); return; }
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle('frost_probe.bin', {create:true});
+      if(!fh.createSyncAccessHandle){ self.postMessage({error:'createSyncAccessHandle missing -- the synchronous OPFS read path FROST relies on is unsupported in this browser'}); return; }
+      let h;
+      try { h = await fh.createSyncAccessHandle(); }
+      catch(err){ self.postMessage({error:'could not open sync handle ('+((err&&err.message)||err)+'). If you just re-ran, reload the page and try once.'}); return; }
+
+      let size = h.getSize();
+      if(size !== FILE_SIZE){
+        say('allocating ' + FILE_MB + ' MB with real data (first run only)...');
+        const chunk = new Uint8Array(1048576);
+        crypto.getRandomValues(chunk.subarray(0, 65536));
+        for(let i=1;i<16;i++) chunk.copyWithin(i*65536, 0, 65536);
+        h.truncate(0);
+        let off = 0, lastReport = 0;
+        while(off < FILE_SIZE){
+          chunk[0] = ((off/1048576)|0) & 255;
+          h.write(chunk, {at: off});
+          off += chunk.length;
+          if(off - lastReport >= 64*1048576){ lastReport = off; say('  ...' + ((off/1048576)|0) + ' MB written'); }
+        }
+        h.flush();
+        size = h.getSize();
+        say('allocated ' + ((size/1048576)|0) + ' MB');
+      } else {
+        say('file already allocated at ' + FILE_MB + ' MB, reusing');
+      }
+
+      const block = new Uint8Array(BLOCK);
+      const maxOff = FILE_SIZE - BLOCK;
+      const times = new Array(READS);
+      for(let i=0;i<5;i++){ h.read(block, {at: (Math.floor(Math.random()*maxOff)) & ~4095}); }
+      for(let i=0;i<READS;i++){
+        const at = (Math.floor(Math.random()*maxOff)) & ~4095;
+        const t0 = performance.now();
+        h.read(block, {at});
+        const t1 = performance.now();
+        times[i] = t1 - t0;
+      }
+      h.close();
+      self.postMessage({done:true, times});
+    } catch(err){
+      self.postMessage({error: (err && err.message) || String(err)});
+    }
+  };`;
+
+  let w;
+  try { w = new Worker(URL.createObjectURL(new Blob([workerSrc], {type:'text/javascript'}))); }
+  catch(err){ log('\nFAILED to start worker: ' + err.message); return; }
+
+  w.onmessage = (e) => {
+    const d = e.data;
+    if(d.log){ log('  ' + d.log); return; }
+    if(d.error){ log('\nWORKER ERROR: ' + d.error); log('\nRESULT: the sync OPFS path did not run here. Copy this and send it to me.'); w.terminate(); return; }
+    if(d.done){
+      const t = d.times, toUs = x => (x*1000);
+      const min = Math.min.apply(null,t), max = Math.max.apply(null,t);
+      const med = pct(t,50), p90 = pct(t,90), p99 = pct(t,99);
+      const zero = t.filter(x=>x===0).length;
+      log('\n=== RESULTS ===');
+      log('reads: ' + t.length + '   block: ' + BLOCK + ' B');
+      log('zero-duration reads (under the timer floor): ' + zero + ' / ' + t.length);
+      log('min:    ' + toUs(min).toFixed(1) + ' us');
+      log('median: ' + toUs(med).toFixed(1) + ' us');
+      log('p90:    ' + toUs(p90).toFixed(1) + ' us');
+      log('p99:    ' + toUs(p99).toFixed(1) + ' us');
+      log('max:    ' + toUs(max).toFixed(1) + ' us');
+      log('\nREAD:');
+      if(zero > t.length*0.8){
+        log(' Most reads register as zero, i.e. faster than this browser can time. At this file size the data is being served from RAM cache, so there is no SSD signal yet. Re-run with File size set much higher (try 256, then 512) to push past the cache.');
+      } else {
+        log(' Reads are measurable and vary. The timing primitive is alive on this device. Next round we induce SSD contention and look for a shift.');
+      }
+      log('\nTap "Copy results" and send me the whole block (note which device and browser).');
+      w.terminate();
+    }
+  };
+  w.onerror = (ev) => { log('\nWORKER failed: ' + (ev.message||ev.filename||'unknown')); };
+  w.postMessage({FILE_MB, BLOCK, READS});
+};
+</script>
+</body>
+</html>
