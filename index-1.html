@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OPFS Contention Test</title>
+<style>
+ body{font:14px/1.55 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:16px;background:#0b1020;color:#e6e9f0}
+ h1{font-size:16px;margin:0 0 4px}
+ .sub{color:#8a93a6;margin:0 0 14px}
+ label{display:inline-block;margin:0 14px 10px 0;color:#b9c0d0;font-size:13px}
+ input{width:84px;font-size:15px;padding:6px 8px;border:1px solid #2a3656;border-radius:6px;background:#070b18;color:#e6e9f0;margin-left:6px}
+ button{font-size:15px;padding:10px 16px;margin:4px 8px 12px 0;border:0;border-radius:8px;background:#3a4cff;color:#fff}
+ button.sec{background:#26304d}
+ pre{white-space:pre-wrap;word-break:break-word;background:#070b18;border:1px solid #1c2742;border-radius:8px;padding:12px;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;min-height:90px}
+</style>
+</head>
+<body>
+<h1>OPFS Contention Test (FROST physics)</h1>
+<p class="sub">Interleaved idle vs drive-load reads in one run. Tests whether disk contention is measurable through OPFS, controlling for run-over-run drift.</p>
+
+<div>
+ <label>Blocks<input id="blocks" type="number" value="16" min="4" max="60"></label>
+ <label>Reads/block<input id="rpb" type="number" value="250" min="50" max="5000"></label>
+ <label>Load file MB<input id="loadmb" type="number" value="512" min="64" max="900"></label>
+</div>
+<button id="run">Run contention test</button>
+<button id="copy" class="sec">Copy results</button>
+<pre id="out">Reuses the big file from the baseline test (frost_probe.bin) and creates one load file (frost_load.bin, written once). Keep load file at 512 to stay under quota. Tap Run.</pre>
+
+<script>
+const out = document.getElementById('out');
+let buf=''; const log=s=>{buf+=s+'\n'; out.textContent=buf;};
+document.getElementById('copy').onclick=async()=>{try{await navigator.clipboard.writeText(buf);log('\n[copied]');}catch(e){log('\n[copy failed: '+e.message+']');}};
+
+let MW=null, LW=null;
+
+function stats(arr){
+  const a=arr.slice().sort((x,y)=>x-y), n=a.length;
+  return {n, med:a[Math.floor(n*0.5)], p90:a[Math.floor(n*0.9)], p99:a[Math.floor(n*0.99)],
+          mean:arr.reduce((s,x)=>s+x,0)/n, nzPct:100*arr.filter(x=>x>0).length/n};
+}
+const us = ms => (ms*1000);
+function mkWorker(src){ return new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'}))); }
+function once(worker,type){ return new Promise(res=>{ const h=e=>{ if(e.data.type===type){ worker.removeEventListener('message',h); res(e.data);} }; worker.addEventListener('message',h); }); }
+function sleep(ms){ return new Promise(r=>setTimeout(r,ms)); }
+
+const measureSrc = `
+let h=null, FILE_SIZE=0; const BLOCK=4096; const block=new Uint8Array(BLOCK);
+self.onmessage=async(e)=>{ const m=e.data;
+  try{
+    if(m.cmd==='init'){
+      const root=await navigator.storage.getDirectory();
+      const fh=await root.getFileHandle('frost_probe.bin',{create:true});
+      if(!fh.createSyncAccessHandle){self.postMessage({type:'err',msg:'no sync handle (measure)'});return;}
+      h=await fh.createSyncAccessHandle(); FILE_SIZE=h.getSize();
+      self.postMessage({type:'ready', size:FILE_SIZE});
+    } else if(m.cmd==='block'){
+      const maxOff=FILE_SIZE-BLOCK; const t=new Array(m.n);
+      for(let i=0;i<m.n;i++){ const at=(Math.floor(Math.random()*maxOff))&~4095;
+        const t0=performance.now(); h.read(block,{at}); const t1=performance.now(); t[i]=t1-t0; }
+      self.postMessage({type:'block', times:t});
+    } else if(m.cmd==='close'){ if(h) h.close(); self.postMessage({type:'closed'}); }
+  }catch(err){ self.postMessage({type:'err', msg:(err&&err.message)||String(err)}); }
+};`;
+
+const loadSrc = `
+let h=null, SIZE=0, running=false;
+const BLOCK=65536; const wbuf=new Uint8Array(BLOCK);
+crypto.getRandomValues(wbuf.subarray(0,4096));
+for(let i=1;i<16;i++) wbuf.copyWithin(i*4096,0,4096);
+async function loop(){
+  const maxOff=SIZE-BLOCK;
+  while(running){
+    for(let k=0;k<12 && running;k++){
+      const at=(Math.floor(Math.random()*maxOff))&~65535; h.write(wbuf,{at}); h.flush();
+      const at2=(Math.floor(Math.random()*maxOff))&~65535; h.read(wbuf,{at:at2});
+    }
+    await new Promise(r=>setTimeout(r,0));
+  }
+}
+self.onmessage=async(e)=>{ const m=e.data;
+  try{
+    if(m.cmd==='init'){
+      const root=await navigator.storage.getDirectory();
+      const fh=await root.getFileHandle('frost_load.bin',{create:true});
+      if(!fh.createSyncAccessHandle){self.postMessage({type:'err',msg:'no sync handle (load)'});return;}
+      h=await fh.createSyncAccessHandle(); SIZE=h.getSize();
+      const want=m.mb*1048576;
+      if(SIZE!==want){
+        self.postMessage({type:'log',msg:'allocating load file '+m.mb+' MB (first time)...'});
+        h.truncate(0); let off=0;
+        while(off<want){ h.write(wbuf,{at:off}); off+=BLOCK;
+          if(off % (128*1048576) < BLOCK) self.postMessage({type:'log',msg:'  ...'+((off/1048576)|0)+' MB'}); }
+        h.flush(); SIZE=h.getSize();
+      }
+      self.postMessage({type:'ready', size:SIZE});
+    } else if(m.cmd==='start'){ if(!running){ running=true; loop(); } self.postMessage({type:'started'}); }
+    else if(m.cmd==='stop'){ running=false; self.postMessage({type:'stopped'}); }
+    else if(m.cmd==='close'){ running=false; if(h) h.close(); self.postMessage({type:'closed'}); }
+  }catch(err){ self.postMessage({type:'err', msg:(err&&err.message)||String(err)}); }
+};`;
+
+document.getElementById('run').onclick=async()=>{
+  if(MW){try{MW.terminate();}catch(e){} MW=null;}
+  if(LW){try{LW.terminate();}catch(e){} LW=null;}
+  await sleep(150);
+  buf=''; out.textContent='';
+  const BLOCKS=Math.max(4,Math.min(60,parseInt(document.getElementById('blocks').value)||16));
+  const RPB=Math.max(50,Math.min(5000,parseInt(document.getElementById('rpb').value)||250));
+  const LOADMB=Math.max(64,Math.min(900,parseInt(document.getElementById('loadmb').value)||512));
+
+  log('=== ENVIRONMENT ===');
+  log('userAgent: '+navigator.userAgent);
+  log('crossOriginIsolated: '+self.crossOriginIsolated);
+  log('hardwareConcurrency: '+navigator.hardwareConcurrency);
+  let rmin=Infinity,last=performance.now();
+  for(let i=0;i<200000;i++){const t=performance.now(),d=t-last; if(d>0&&d<rmin)rmin=d; last=t;}
+  log('timer floor: '+us(rmin).toFixed(1)+' us');
+  if(navigator.storage&&navigator.storage.estimate){try{const est=await navigator.storage.estimate();log('quota: '+((est.quota/1048576)|0)+' MB, used: '+((est.usage/1048576)|0)+' MB');}catch(e){}}
+
+  log('\nstarting workers...');
+  let mw, lw;
+  try{
+    mw=mkWorker(measureSrc); lw=mkWorker(loadSrc); MW=mw; LW=lw;
+    mw.addEventListener('message',e=>{ if(e.data.type==='log')log('  [m] '+e.data.msg); if(e.data.type==='err')log('  [m ERR] '+e.data.msg); });
+    lw.addEventListener('message',e=>{ if(e.data.type==='log')log('  [load] '+e.data.msg); if(e.data.type==='err')log('  [load ERR] '+e.data.msg); });
+    mw.postMessage({cmd:'init'});
+    const mr=await once(mw,'ready');
+    log('measure file: '+((mr.size/1048576)|0)+' MB');
+    if(mr.size < 256*1048576) log('WARNING: baseline file is only '+((mr.size/1048576)|0)+' MB. Run the 1024 baseline first or results may be cache-dominated.');
+    lw.postMessage({cmd:'init', mb:LOADMB});
+    const lr=await once(lw,'ready');
+    log('load file: '+((lr.size/1048576)|0)+' MB ready');
+  }catch(err){ log('worker init failed: '+err.message); return; }
+
+  log('\n=== CONTENTION TEST ===');
+  log('blocks: '+BLOCKS+'  reads/block: '+RPB+'  (alternating idle / load)');
+  const idle=[], load=[];
+  for(let b=0;b<BLOCKS;b++){
+    const isLoad=(b%2===1);
+    if(isLoad){ lw.postMessage({cmd:'start'}); await once(lw,'started'); await sleep(180); }
+    mw.postMessage({cmd:'block', n:RPB});
+    const res=await once(mw,'block');
+    if(isLoad){ lw.postMessage({cmd:'stop'}); await once(lw,'stopped'); await sleep(180); }
+    (isLoad?load:idle).push(...res.times);
+    log('  block '+(b+1)+'/'+BLOCKS+'  '+(isLoad?'LOAD':'idle'));
+  }
+  mw.postMessage({cmd:'close'}); lw.postMessage({cmd:'close'});
+
+  const si=stats(idle), sl=stats(load);
+  log('\n=== RESULTS ===');
+  log('IDLE  n='+si.n+'  nonzero='+si.nzPct.toFixed(1)+'%  median='+us(si.med).toFixed(1)+'  mean='+us(si.mean).toFixed(1)+'  p90='+us(si.p90).toFixed(1)+'  p99='+us(si.p99).toFixed(1)+' us');
+  log('LOAD  n='+sl.n+'  nonzero='+sl.nzPct.toFixed(1)+'%  median='+us(sl.med).toFixed(1)+'  mean='+us(sl.mean).toFixed(1)+'  p90='+us(sl.p90).toFixed(1)+'  p99='+us(sl.p99).toFixed(1)+' us');
+  const md=us(sl.mean-si.mean), nzd=sl.nzPct-si.nzPct, medd=us(sl.med-si.med);
+  log('\nDELTA  mean: '+(md>=0?'+':'')+md.toFixed(1)+' us   median: '+(medd>=0?'+':'')+medd.toFixed(1)+' us   nonzero: '+(nzd>=0?'+':'')+nzd.toFixed(1)+' pts');
+  log('\nREAD:');
+  if(md>50 && nzd>3){
+    log(' Drive load measurably slowed the reads (higher mean, more reads above the floor under load). The contention channel FROST relies on is present and detectable on this device, even through the Brave timer clamp. This is the core physics, not the full attack.');
+  } else if(md>50 || nzd>3){
+    log(' Weak or partial signal. Load nudged the reads but not decisively. Borderline, re-run to see if it holds. The effect may be near the noise floor.');
+  } else {
+    log(' No contention signal separable from noise. Under load the reads did not slow measurably. On this stack the channel looks buried under the timer floor and cache. That is a real negative result.');
+  }
+  log('\nTap Copy results and send the whole block (note device + browser).');
+};
+</script>
+</body>
+</html>
