@@ -73,9 +73,10 @@ async function loop(){
   const maxOff=SIZE-BLOCK;
   while(running){
     for(let k=0;k<12 && running;k++){
-      const at=(Math.floor(Math.random()*maxOff))&~65535; h.write(wbuf,{at}); h.flush();
+      const at=(Math.floor(Math.random()*maxOff))&~65535; h.write(wbuf,{at});
       const at2=(Math.floor(Math.random()*maxOff))&~65535; h.read(wbuf,{at:at2});
     }
+    h.flush();
     await new Promise(r=>setTimeout(r,0));
   }
 }
@@ -91,7 +92,7 @@ self.onmessage=async(e)=>{ const m=e.data;
         self.postMessage({type:'log',msg:'allocating load file '+m.mb+' MB (first time)...'});
         h.truncate(0); let off=0;
         while(off<want){ h.write(wbuf,{at:off}); off+=BLOCK;
-          if(off % (128*1048576) < BLOCK) self.postMessage({type:'log',msg:'  ...'+((off/1048576)|0)+' MB'}); }
+          if(off % (128*1048576) < BLOCK){ self.postMessage({type:'log',msg:'  ...'+((off/1048576)|0)+' MB'}); await new Promise(r=>setTimeout(r,0)); } }
         h.flush(); SIZE=h.getSize();
       }
       self.postMessage({type:'ready', size:SIZE});
