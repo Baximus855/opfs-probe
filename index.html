@@ -20,7 +20,7 @@
 <p class="sub">Step 1: does the FROST primitive exist on this browser, and can we time reads.</p>
 
 <div>
- <label>File size (MB)<input id="mb" type="number" value="64" min="8" max="1024"></label>
+ <label>File size (MB)<input id="mb" type="number" value="64" min="8" max="2048"></label>
  <label>Reads<input id="reads" type="number" value="800" min="100" max="20000"></label>
 </div>
 <button id="run">Run probe</button>
@@ -53,7 +53,7 @@ function timerResolution(){
 
 document.getElementById('run').onclick = async () => {
   buf=''; out.textContent='';
-  const FILE_MB = Math.max(8, Math.min(1024, parseInt(document.getElementById('mb').value)||64));
+  const FILE_MB = Math.max(8, Math.min(2048, parseInt(document.getElementById('mb').value)||64));
   const READS   = Math.max(100, Math.min(20000, parseInt(document.getElementById('reads').value)||800));
   const BLOCK   = 4096;
 
